@@ -17,7 +17,7 @@ HOME = Path(tempfile.mkdtemp(prefix="comsol-mcp-edge-"))
 os.environ["COMSOL_MCP_HOME"] = str(HOME)
 os.environ["COMSOL_MCP_IDLE_TIMEOUT"] = "0"
 
-import comsol_mcp.server as s  # noqa: E402
+import comsol_mcp.server as s
 
 FAILED = []
 

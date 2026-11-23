@@ -1510,7 +1510,7 @@ def comsol_model(
             if MODEL is not None:
                 try:
                     current_tag = str(MODEL.java.tag())
-                except Exception:  # noqa: BLE001
+                except Exception:
                     current_tag = None
             was_current = current_tag == target_tag
             client.remove(target)
