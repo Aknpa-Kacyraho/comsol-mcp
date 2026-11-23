@@ -48,9 +48,11 @@ pip install -e .
 ```powershell
 python -c "import comsol_mcp; print(comsol_mcp.__version__)"
 python tests\smoke_test.py
+python tests\modeling_test.py
+python tests\full_test.py
 ```
 
-冒烟测试会在随机端口起一个独立 server，跑完自动清理，不影响正在使用的 COMSOL。
+每个测试都会在随机端口起独立 server，跑完自动清理，不影响正在使用的 COMSOL。
 
 ## 配置 MCP 客户端
 
@@ -91,6 +93,33 @@ python tests\smoke_test.py
 }
 ```
 
+### DeepSeek Harness (DSH)
+
+在 `home/cordis.patch.yml` 的 `insert` 下加一段：
+
+```yaml
+    - id: mcp-comsol
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: comsol
+        transport: stdio
+        command: 'C:/path/to/comsol-mcp/.venv/Scripts/python.exe'
+        args:
+          - 'C:/path/to/comsol-mcp/server.py'
+        cwd: 'C:/path/to/comsol-mcp'
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8'
+        toolCallTimeoutMs: 3600000
+```
+
+工具在 DSH 里显示为 `mcp__comsol__*`，改完重启 DSH 生效。
+
+### 其他 stdio 客户端（Cline 等）
+
+命令和参数与 Claude Desktop 相同。任何支持 stdio MCP 的客户端都能用；
+服务端只往 `logs/` 写日志，stdout 全部留给协议。
+
 ## 工具
 
 | 工具 | 作用 |
@@ -107,12 +136,15 @@ python tests\smoke_test.py
 | `comsol_selection` | 命名选择（Box/Ball/Explicit），供边界条件复用 |
 | `comsol_diagnose` | 模型体检：COMSOL 报告的问题 + 缺失的几何/物理场/材料/网格/研究 |
 | `comsol_help` | 离线速查：几何、传热、结构、流动、静电、选择、网格的属性名 |
+| `comsol_material` | 材料：内置铜/铝/钢/硅/水/空气预设，或自定义物性 |
 | `comsol_params` | 读写全局参数（支持 `200[A]`、`1.5[mm]`） |
+| `comsol_sweep` | 参数扫描（参数名 + 取值列表，自动推断单位） |
 | `comsol_mesh` | 生成网格，可选密度 1–9 |
 | `comsol_solve` | 运行研究，支持后台模式 |
 | `comsol_eval` | 表达式求值，返回 min/max/mean |
 | `comsol_plot` | 任意表达式出表面图并导出 PNG |
-| `comsol_export` | 场量导出 CSV |
+| `comsol_export` | 场量导出 CSV（含 x/y/z 坐标） |
+| `comsol_model` | 列出、卸载、重命名已加载模型 |
 | `comsol_python` | 执行 Python，直接调 COMSOL Java API |
 | `comsol_desktop` | 启动 Desktop 并连到当前 server |
 | `comsol_screenshot` | 截 COMSOL 窗口，让 AI 看到当前界面 |
@@ -139,7 +171,7 @@ COMSOL 支持 client–server 模式：server 持有模型，Desktop 只是客�
 
 ## 逃生舱示例
 
-21 个工具覆盖不到的操作，都可以用 `comsol_python` 完成（可用 `model`、`java`、`client`、`mph`、`np`）：
+24 个工具覆盖不到的操作，都可以用 `comsol_python` 完成（可用 `model`、`java`、`client`、`mph`、`np`）：
 
 ```python
 ht = java.modelNode('comp1').physics('ht')
@@ -169,6 +201,7 @@ flux.set('q0', '1e4[W/m^2]')
 ## 已知限制
 
 - 一个进程只能创建一个 COMSOL client：`comsol_stop` 之后需要重启 MCP 进程才能重新连接（JVM 限制）。
+- COMSOL Java API 没有暴露取消求解的接口：长求解只能等它结束，或重启 COMSOL 进程。
 - 求解进度只有"运行中/已完成"，没有百分比。
 - `comsol_screenshot` 会先把 COMSOL 窗口置前再截图，会短暂抢焦点。
 - 截图、启动 Desktop 仅 Windows。
@@ -178,6 +211,11 @@ flux.set('q0', '1e4[W/m^2]')
 - [MPh](https://github.com/MPh-py/MPh) — Python 调用 COMSOL Java API 的桥梁。
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — server 框架。
 - 设计参考：[wjc9011/COMSOL_Multiphysics_MCP](https://github.com/wjc9011/COMSOL_Multiphysics_MCP) 和 [Ching-Chiang/comsol-mcp](https://github.com/Ching-Chiang/comsol-mcp)。`comsol_geometry` / `comsol_physics` 的「feature type + properties」通用模式来自这两个项目。
+
+## 自检
+
+0.3.0 经过了用户 / 设计师 / 工程师三视角检查，清单和修复记录见
+[docs/SELF-CHECK.md](docs/SELF-CHECK.md)。
 
 ## 免责声明
 

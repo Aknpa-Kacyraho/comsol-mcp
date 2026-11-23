@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 HOME = Path(tempfile.mkdtemp(prefix="comsol-mcp-test-"))
 os.environ["COMSOL_MCP_HOME"] = str(HOME)
 
-import comsol_mcp.server as s  # noqa: E402
+import comsol_mcp.server as s
 
 FAILED = []
 

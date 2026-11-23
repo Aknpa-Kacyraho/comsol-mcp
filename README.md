@@ -48,9 +48,11 @@ Verify:
 ```powershell
 python -c "import comsol_mcp; print(comsol_mcp.__version__)"
 python tests\smoke_test.py
+python tests\modeling_test.py
+python tests\full_test.py
 ```
 
-The smoke test starts its own COMSOL server on a random port and cleans up after itself.
+Each test starts its own COMSOL server on a random port and cleans up after itself.
 
 ## Configure your MCP client
 
@@ -96,6 +98,34 @@ The smoke test starts its own COMSOL server on a random port and cleans up after
 }
 ```
 
+### DeepSeek Harness (DSH)
+
+Add an entry to `home/cordis.patch.yml` (under `insert`):
+
+```yaml
+    - id: mcp-comsol
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: comsol
+        transport: stdio
+        command: 'C:/path/to/comsol-mcp/.venv/Scripts/python.exe'
+        args:
+          - 'C:/path/to/comsol-mcp/server.py'
+        cwd: 'C:/path/to/comsol-mcp'
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8'
+        toolCallTimeoutMs: 3600000
+```
+
+Tools then appear as `mcp__comsol__*`. Restart DSH to pick up the change.
+
+### Cline / other stdio clients
+
+Use the same command and args as Claude Desktop. Any client that speaks
+stdio MCP works; the server only writes logs to `logs/` and nothing to stdout
+except protocol messages.
+
 ## Tools
 
 | Tool | What it does |
@@ -112,12 +142,15 @@ The smoke test starts its own COMSOL server on a random port and cleans up after
 | `comsol_selection` | Named Box / Ball / Explicit selections, then reuse them in boundary conditions |
 | `comsol_diagnose` | Model health check: COMSOL-reported problems plus missing geometry/physics/material/mesh/study |
 | `comsol_help` | Offline cheat sheets for geometry, heat, solid, flow, electrostatics, selection, mesh |
+| `comsol_material` | Materials from built-in presets (copper/aluminum/steel/silicon/water/air) or custom properties |
 | `comsol_params` | Read or set global parameters (`200[A]`, `1.5[mm]`, ...) |
+| `comsol_sweep` | Add a parametric sweep (parameter names + value lists, units inferred) |
 | `comsol_mesh` | Build the mesh, optional density level 1–9 |
 | `comsol_solve` | Run a study, foreground or background |
 | `comsol_eval` | Evaluate an expression, return min/max/mean |
 | `comsol_plot` | Render a surface plot of any expression and export PNG |
-| `comsol_export` | Export field values to CSV |
+| `comsol_export` | Export field values (with x/y/z coordinates) to CSV |
+| `comsol_model` | List, remove from memory, or rename loaded models |
 | `comsol_python` | Execute Python against the COMSOL Java API |
 | `comsol_desktop` | Launch COMSOL Desktop and connect it to the running server |
 | `comsol_screenshot` | Capture the COMSOL window so the assistant can see the current UI |
@@ -152,7 +185,7 @@ python examples\heat_transfer_2d.py
 
 ## Escape hatch
 
-Anything the 21 tools do not cover can be done through `comsol_python`, which exposes `model`, `java`, `client`, `mph`, `np`:
+Anything the 24 tools do not cover can be done through `comsol_python`, which exposes `model`, `java`, `client`, `mph`, `np`:
 
 ```python
 ht = java.modelNode('comp1').physics('ht')
@@ -182,6 +215,7 @@ Useful Java API entry points:
 ## Limitations
 
 - One COMSOL client per process: after `comsol_stop`, the MCP process must be restarted before connecting again (JVM limitation).
+- Cancelling a running solve is not exposed by the COMSOL Java API; a long solve must finish, or the COMSOL process must be restarted.
 - Progress reporting during solve is coarse — the job is either running or finished, no percentage.
 - `comsol_screenshot` brings the COMSOL window to the foreground before capturing; it will briefly steal focus.
 - Windows-specific helpers: screenshot, and launching Desktop. Everything else works wherever MPh works.
@@ -191,6 +225,11 @@ Useful Java API entry points:
 - [MPh](https://github.com/MPh-py/MPh) — the Python bridge to the COMSOL Java API that makes all of this possible.
 - [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — server framework.
 - Prior art that informed the tool design: [wjc9011/COMSOL_Multiphysics_MCP](https://github.com/wjc9011/COMSOL_Multiphysics_MCP) and [Ching-Chiang/comsol-mcp](https://github.com/Ching-Chiang/comsol-mcp). Their generic "feature type + properties" pattern is what our `comsol_geometry` / `comsol_physics` tools follow.
+
+## Self-check
+
+The 0.3.0 release went through a three-perspective review (user / designer / engineer).
+See [docs/SELF-CHECK.md](docs/SELF-CHECK.md) for the checklist and what was fixed.
 
 ## Disclaimer
 

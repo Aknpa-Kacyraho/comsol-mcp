@@ -22,9 +22,9 @@ import json
 import logging
 import os
 import queue
+import re
 import socket
 import subprocess
-import sys
 import threading
 import time
 import traceback
@@ -68,14 +68,14 @@ def _comsol_exe(name: str = "comsol.exe") -> Path:
     root = COMSOL_ROOT or Path(".")
     return root / "bin" / "win64" / name
 
-import mph  # noqa: E402  (导入较慢，放在日志配置之后)
+import mph
 
 try:
     import numpy as np
 except Exception:  # pragma: no cover
     np = None
 
-from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.mcpserver import MCPServer
 
 mcp = MCPServer(
     "comsol",
@@ -140,7 +140,7 @@ class Worker:
             fn, box, done = item
             try:
                 box["result"] = fn()
-            except BaseException as exc:  # noqa: BLE001
+            except BaseException as exc:
                 box["error"] = exc
                 box["traceback"] = traceback.format_exc()
             finally:
@@ -184,6 +184,10 @@ def _idle_watchdog() -> None:
         time.sleep(interval)
         if IDLE_TIMEOUT <= 0:
             continue
+        if _snapshot().get("busy"):
+            # 求解中绝不退出，否则会丢掉正在算的结果
+            LAST_ACTIVITY[0] = time.time()
+            continue
         if time.time() - LAST_ACTIVITY[0] > IDLE_TIMEOUT:
             log.info("Idle for %ss, exiting to avoid a stale process.", IDLE_TIMEOUT)
             os._exit(0)
@@ -224,9 +228,19 @@ def _resolve(path: str) -> Path:
 
 
 def _port_open(port: int, host: str = "127.0.0.1") -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.6)
-        return s.connect_ex((host, port)) == 0
+    # COMSOL 有时只监听 IPv6（::），两种都试一遍
+    for family, address in (
+        (socket.AF_INET, (host, port)),
+        (socket.AF_INET6, ("::1", port)),
+    ):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.settimeout(0.6)
+                if s.connect_ex(address) == 0:
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def _need_client():
@@ -266,30 +280,43 @@ def _safe(fn, **kwargs):
     """执行并忽略异常，用于取属性。"""
     try:
         return fn()
-    except Exception as exc:  # noqa: BLE001
+    except Exception:
         if kwargs.get("raise"):
             raise
         return None
 
 
 def _status_dict() -> dict[str, Any]:
+    # 只读共享缓存，不碰 JVM：status 可能在任何线程被调用
     with STATE_LOCK:
         data = dict(STATE)
-        data["models"] = list(STATE["models"])
+        data["models"] = [dict(m) for m in STATE["models"]]
+        if STATE.get("current"):
+            data["current"] = dict(STATE["current"])
+    return data
+
+
+def _refresh_state() -> None:
+    """刷新模型缓存。必须在 worker 线程里调用。"""
+    models: list[dict[str, Any]] = []
+    current = None
     if CLIENT is not None:
         try:
-            data["models"] = [
+            models = [
                 {"name": m.name(), "tag": str(m.java.tag())} for m in CLIENT.models()
             ]
-            if MODEL is not None:
-                data["current"] = {
+        except Exception as exc:
+            log.warning("Could not refresh model list: %s", exc)
+        if MODEL is not None:
+            try:
+                current = {
                     "name": MODEL.name(),
                     "tag": str(MODEL.java.tag()),
                     "file": str(MODEL.file()) if _has_file(MODEL) else None,
                 }
-        except Exception as exc:  # noqa: BLE001
-            data["state_error"] = str(exc)
-    return data
+            except Exception:
+                current = None
+    _set(models=models, current=current)
 
 
 def _has_file(model) -> bool:
@@ -341,7 +368,12 @@ def _connect_or_start(port: int, cores: int | None, version: str | None):
     )
 )
 def comsol_status() -> str:
-    return _json(_status_dict())
+    data = _status_dict()
+    if not data.get("connected"):
+        data["hint"] = "还没有连接 COMSOL。运行 comsol_start 开始（默认端口 2036）。"
+    elif data.get("busy"):
+        data["hint"] = "后台求解进行中，用 comsol_status 轮询；不要重复提交。"
+    return _json(data)
 
 
 @mcp.tool(
@@ -354,17 +386,18 @@ def comsol_status() -> str:
 def comsol_start(port: int = DEFAULT_PORT, cores: int = 0, version: str = "") -> str:
     def job():
         client = _connect_or_start(port, cores or None, version or None)
+        _refresh_state()
         return {
             "connected": True,
             "port": _snapshot().get("port") or port,
             "version": client.version,
             "started_by_us": _snapshot().get("started_by_us"),
-            "models": [m.name() for m in client.models()],
+            "models": [m["name"] for m in _snapshot().get("models", [])],
         }
 
     try:
         return _json(WORKER.call(job, timeout=180))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _set(last_error=str(exc))
         return _json({"error": str(exc)})
 
@@ -376,21 +409,19 @@ def comsol_start(port: int = DEFAULT_PORT, cores: int = 0, version: str = "") ->
     )
 )
 def comsol_stop(stop_server: bool = True) -> str:
-    global CLIENT, MODEL
-
     def job():
         global CLIENT, MODEL
         info: dict[str, Any] = {}
         if CLIENT is not None:
             try:
                 CLIENT.disconnect()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 info["disconnect_error"] = str(exc)
             CLIENT = None
             MODEL = None
         if stop_server:
             try:
-                import mph.session as session
+                from mph import session
 
                 server = getattr(session, "server", None)
                 if server is not None:
@@ -399,7 +430,7 @@ def comsol_stop(stop_server: bool = True) -> str:
                     info["server_stopped"] = True
                 else:
                     info["server_stopped"] = False
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 info["server_error"] = str(exc)
         _set(
             connected=False,
@@ -415,7 +446,7 @@ def comsol_stop(stop_server: bool = True) -> str:
 
     try:
         return _json(WORKER.call(job, timeout=60))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -432,13 +463,12 @@ def comsol_stop(stop_server: bool = True) -> str:
     )
 )
 def comsol_open(path: str = "", new: bool = False, name: str = "") -> str:
-    global MODEL
-
     def job():
         global MODEL
         client = _need_client() if CLIENT is not None else _connect_or_start(
             DEFAULT_PORT, None, None
         )
+        reused = False
         if new:
             MODEL = client.create(name or "Model")
             source = None
@@ -448,21 +478,32 @@ def comsol_open(path: str = "", new: bool = False, name: str = "") -> str:
             target = _resolve(path)
             if not target.exists():
                 raise FileNotFoundError(f"找不到模型文件：{target}")
-            MODEL = client.load(str(target))
+            # 同一个文件已经加载过就复用，避免堆出 model2/model3 副本
+            for candidate in client.models():
+                try:
+                    if Path(str(candidate.file())).resolve() == target:
+                        MODEL = candidate
+                        reused = True
+                        break
+                except Exception:
+                    continue
+            if MODEL is None or not reused:
+                MODEL = client.load(str(target))
             source = str(target)
 
-        _set(models=[m.name() for m in client.models()])
+        _refresh_state()
         info = {
             "name": MODEL.name(),
             "tag": str(MODEL.java.tag()),
             "file": source,
             "components": MODEL.components(),
+            "reused": reused,
         }
         return info
 
     try:
         return _json(WORKER.call(job, timeout=600))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _set(last_error=str(exc))
         return _json({"error": str(exc)})
 
@@ -486,6 +527,7 @@ def comsol_use(model: str) -> str:
             names = [f"{m.name()}({m.java.tag()})" for m in client.models()]
             raise ValueError(f"找不到模型 {model}，现有：{names}")
         MODEL = target
+        _refresh_state()
         return {
             "current": MODEL.name(),
             "tag": str(MODEL.java.tag()),
@@ -494,7 +536,7 @@ def comsol_use(model: str) -> str:
 
     try:
         return _json(WORKER.call(job, timeout=60))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -519,6 +561,7 @@ def comsol_save(path: str = "", backup: bool = True) -> str:
             backup_path = target.with_name(f"{target.stem}.bak-{stamp}{target.suffix}")
             target.replace(backup_path)
         model.java.save(str(target))
+        _refresh_state()
         return {
             "saved": str(target),
             "backup": str(backup_path) if backup_path else None,
@@ -527,7 +570,7 @@ def comsol_save(path: str = "", backup: bool = True) -> str:
 
     try:
         return _json(WORKER.call(job, timeout=300))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _set(last_error=str(exc))
         return _json({"error": str(exc)})
 
@@ -570,7 +613,7 @@ def comsol_inspect() -> str:
                         "domains": _safe(g.getNDomains),
                         "boundaries": _safe(g.getNBoundaries),
                         "features": [
-                            {"tag": t, "type": _safe(lambda t=t: str(g.feature(t).getType()))}
+                            {"tag": t, "type": _safe(lambda t=t, g=g: str(g.feature(t).getType()))}
                             for t in _tags(g.feature())
                         ],
                     }
@@ -583,7 +626,7 @@ def comsol_inspect() -> str:
                 feats = []
                 for ftag in _tags(p.feature()):
                     f = p.feature(ftag)
-                    ent = _safe(lambda: [int(x) for x in f.selection().entities()])
+                    ent = _safe(lambda f=f: [int(x) for x in f.selection().entities()])
                     feats.append(
                         {
                             "tag": ftag,
@@ -608,6 +651,18 @@ def comsol_inspect() -> str:
                 {"tag": t, "label": _label(comp_node.material(t))}
                 for t in _tags(comp_node.material())
             ]
+            comp["selections"] = [
+                {
+                    "tag": t,
+                    "type": _safe(lambda t=t, c=comp_node: str(c.selection(t).getType())),
+                    "entities": _safe(
+                        lambda t=t, c=comp_node: [
+                            int(x) for x in c.selection(t).entities()
+                        ]
+                    ),
+                }
+                for t in _tags(comp_node.selection())
+            ]
             comp["meshes"] = []
             for mtag in _tags(comp_node.mesh()):
                 m = comp_node.mesh(mtag)
@@ -627,7 +682,7 @@ def comsol_inspect() -> str:
                     "tag": stag,
                     "label": _label(s),
                     "features": [
-                        {"tag": t, "type": _safe(lambda t=t: str(s.feature(t).getType()))}
+                        {"tag": t, "type": _safe(lambda t=t, s=s: str(s.feature(t).getType()))}
                         for t in _tags(s.feature())
                     ],
                 }
@@ -655,7 +710,7 @@ def comsol_inspect() -> str:
 
     try:
         return _json(WORKER.call(job, timeout=120))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -703,7 +758,12 @@ def _first_component(j) -> str:
 
 def _ensure_component(j, component: str = "", dimension: int = 3) -> str:
     tags = _tags(j.modelNode())
-    if component and component in tags:
+    if component:
+        if component in tags:
+            return component
+        # 明确指定了不存在的组件：创建它，而不是静默用第一个
+        j.modelNode().create(component)
+        j.modelNode(component).geom().create("geom1", int(dimension or 3))
         return component
     if tags:
         return tags[0]
@@ -769,7 +829,7 @@ def comsol_geometry(
                             "features": [
                                 {
                                     "tag": t,
-                                    "type": _safe(lambda t=t: str(g.feature(t).getType())),
+                                    "type": _safe(lambda t=t, g=g: str(g.feature(t).getType())),
                                 }
                                 for t in _tags(g.feature())
                             ],
@@ -818,11 +878,11 @@ def comsol_geometry(
                 "elapsed_s": round(time.time() - t0, 2),
             }
 
-        raise ValueError(f"未知 action：{action}")
+        raise ValueError(f"未知 action：{action}，可用：list/create/update/delete/run")
 
     try:
         return _json(WORKER.call(job, timeout=600))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -866,9 +926,9 @@ def comsol_physics(
                         "features": [
                             {
                                 "tag": ft,
-                                "type": _safe(lambda ft=ft: str(p.feature(ft).getType())),
+                                "type": _safe(lambda ft=ft, p=p: str(p.feature(ft).getType())),
                                 "selection": _safe(
-                                    lambda ft=ft: [
+                                    lambda ft=ft, p=p: [
                                         int(x) for x in p.feature(ft).selection().entities()
                                     ]
                                 ),
@@ -904,7 +964,11 @@ def comsol_physics(
         if action_lower == "add_feature":
             if not feature_type:
                 raise ValueError("add_feature 需要 feature_type。")
-            dim = dimension or max(1, _geometry_dim(j, ctag, _tags(j.modelNode(ctag).geom())[0]) - 1)
+            geoms = _tags(j.modelNode(ctag).geom())
+            if not geoms:
+                raise RuntimeError("组件没有几何，先用 comsol_geometry 创建。")
+            gdim = _geometry_dim(j, ctag, geoms[0])
+            dim = int(dimension) if dimension else max(1, gdim - 1)
             ftag = tag or f"{feature_type.lower()[:8]}_{len(_tags(p.feature())) + 1}"
             feat = p.create(ftag, feature_type, int(dim))
             if named_selection:
@@ -941,11 +1005,14 @@ def comsol_physics(
             p.feature().remove(tag)
             return {"removed": tag}
 
-        raise ValueError(f"未知 action：{action}")
+        raise ValueError(
+            f"未知 action：{action}，可用：list/add_interface/remove_interface/"
+            "add_feature/update_feature/remove_feature"
+        )
 
     try:
         return _json(WORKER.call(job, timeout=600))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -956,6 +1023,7 @@ def comsol_physics(
         "selection_type=Box 时用 box=[xmin,xmax,ymin,ymax,zmin,zmax]（2D 可只给 4 个数）；"
         "Ball 时用 center=[x,y,z] + radius；Explicit 时用 entities=[...]。"
         "entity_dim 为选择的实体维度：3=域、2=面（3D 边界）、1=边、0=自动取几何维度。"
+        "condition 默认 intersects（与选择区域相交即选中），需要完全包含时传 inside。"
         "创建后可在 comsol_physics 里用 named_selection 把选择绑到边界条件上。"
     )
 )
@@ -969,7 +1037,7 @@ def comsol_selection(
     center: list[float] | None = None,
     radius: float = 0.0,
     entities: list[int] | None = None,
-    condition: str = "inside",
+    condition: str = "",
 ) -> str:
     def job():
         model = _need_model()
@@ -998,13 +1066,15 @@ def comsol_selection(
             return {"removed": tag}
 
         if action_lower != "create":
-            raise ValueError(f"未知 action：{action}")
+            raise ValueError(f"未知 action：{action}，可用：list/create/remove")
 
         sel_tag = tag or f"sel_{len(_tags(comp.selection())) + 1}"
 
         geom_tag = _tags(comp.geom())[0] if _tags(comp.geom()) else ""
         gdim = _geometry_dim(j, ctag, geom_tag) if geom_tag else 3
         dim = int(entity_dim) if entity_dim else gdim
+        # 域选择用 intersects（避免边界重合判定失败），面/边用 inside（避免误选相邻实体）
+        cond = condition or ("intersects" if dim >= gdim else "inside")
 
         sel = comp.selection().create(sel_tag, selection_type)
         try:
@@ -1021,13 +1091,15 @@ def comsol_selection(
             names = ["xmin", "xmax", "ymin", "ymax", "zmin", "zmax"]
             for name, value in zip(names, coords):
                 sel.set(name, float(value))
-            sel.set("condition", condition)
+            sel.set("condition", cond)
         elif selection_type == "Ball":
             if not center or len(center) < 2:
                 raise ValueError("Ball 选择需要 center。")
-            sel.set("pos", [str(x) for x in center])
+            sel.set("posx", float(center[0]))
+            sel.set("posy", float(center[1]))
+            sel.set("posz", float(center[2]) if len(center) > 2 else 0.0)
             sel.set("r", float(radius or 0.01))
-            sel.set("condition", condition)
+            sel.set("condition", cond)
         elif selection_type == "Explicit":
             if not entities:
                 raise ValueError("Explicit 选择需要 entities。")
@@ -1044,7 +1116,7 @@ def comsol_selection(
 
     try:
         return _json(WORKER.call(job, timeout=120))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -1095,9 +1167,63 @@ def comsol_diagnose() -> str:
 
     try:
         return _json(WORKER.call(job, timeout=120))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
+
+MATERIAL_PRESETS: dict[str, dict[str, str]] = {
+    "copper": {
+        "thermalconductivity": "400[W/(m*K)]",
+        "density": "8960[kg/m^3]",
+        "heatcapacity": "385[J/(kg*K)]",
+        "youngsmodulus": "110e9[Pa]",
+        "poissonsratio": "0.35",
+        "electricconductivity": "5.998e7[S/m]",
+        "relpermittivity": "1",
+    },
+    "aluminum": {
+        "thermalconductivity": "237[W/(m*K)]",
+        "density": "2700[kg/m^3]",
+        "heatcapacity": "900[J/(kg*K)]",
+        "youngsmodulus": "70e9[Pa]",
+        "poissonsratio": "0.33",
+        "electricconductivity": "3.77e7[S/m]",
+        "relpermittivity": "1",
+    },
+    "steel": {
+        "thermalconductivity": "44.5[W/(m*K)]",
+        "density": "7850[kg/m^3]",
+        "heatcapacity": "475[J/(kg*K)]",
+        "youngsmodulus": "200e9[Pa]",
+        "poissonsratio": "0.30",
+        "electricconductivity": "4.032e6[S/m]",
+        "relpermittivity": "1",
+    },
+    "silicon": {
+        "thermalconductivity": "130[W/(m*K)]",
+        "density": "2329[kg/m^3]",
+        "heatcapacity": "700[J/(kg*K)]",
+        "youngsmodulus": "170e9[Pa]",
+        "poissonsratio": "0.28",
+        "relpermittivity": "11.7",
+        "electricconductivity": "1e-12[S/m]",
+    },
+    "water": {
+        "thermalconductivity": "0.6[W/(m*K)]",
+        "density": "1000[kg/m^3]",
+        "heatcapacity": "4180[J/(kg*K)]",
+        "dynamicviscosity": "1e-3[Pa*s]",
+        "relpermittivity": "80",
+        "electricconductivity": "5.5e-6[S/m]",
+    },
+    "air": {
+        "thermalconductivity": "0.026[W/(m*K)]",
+        "density": "1.2[kg/m^3]",
+        "heatcapacity": "1005[J/(kg*K)]",
+        "dynamicviscosity": "1.8e-5[Pa*s]",
+        "relpermittivity": "1",
+    },
+}
 
 HELP_TOPICS: dict[str, str] = {
     "geometry": (
@@ -1134,13 +1260,22 @@ HELP_TOPICS: dict[str, str] = {
         "comsol_mesh 的 size 1-9（5 左右日常够用）。局部细化可在 "
         "comsol_python 里用 mesh.create('ftr1','Size') + selection。"
     ),
+    "study": (
+        "稳态：study.create('stat','Stationary')。瞬态：study.create('time','Transient')，"
+        "再用 time.set('tlist', '0 1 2 5') 设时间点。特征频率："
+        "study.create('eig','Eigenfrequency')。求解统一用 comsol_solve。"
+    ),
+    "sweep": (
+        "参数扫描用 comsol_sweep：parameters=['V0']，values=['1 2 3']，单位从参数定义自动推断。"
+        "多个参数时 values 长度必须与 parameters 一致；全因子组合会自动展开。"
+    ),
 }
 
 
 @mcp.tool(
     description=(
         "COMSOL 建模速查，不访问 COMSOL。topic 可选 geometry/heat/solid/flow/"
-        "electrostatics/selection/mesh。写模型前先查，能少踩属性名和单位的坑。"
+        "electrostatics/selection/mesh/study/sweep。写模型前先查，能少踩属性名和单位的坑。"
     )
 )
 def comsol_help(topic: str = "geometry") -> str:
@@ -1148,6 +1283,247 @@ def comsol_help(topic: str = "geometry") -> str:
     if key in HELP_TOPICS:
         return _json({"topic": key, "cheatsheet": HELP_TOPICS[key]})
     return _json({"topics": list(HELP_TOPICS)})
+
+
+@mcp.tool(
+    description=(
+        "材料工具。action=list 列出材料和当前物性；create 新建材料，preset 可选 "
+        "copper/aluminum/steel/silicon/water/air，或用 properties 传自定义物性；"
+        "update 改属性；remove 删除。属性名如 thermalconductivity、density、"
+        "heatcapacity、youngsmodulus、poissonsratio、electricconductivity、"
+        "relpermittivity、dynamicviscosity，值可带单位。"
+    )
+)
+def comsol_material(
+    action: str = "list",
+    component: str = "",
+    tag: str = "",
+    preset: str = "",
+    properties: dict | None = None,
+) -> str:
+    def job():
+        model = _need_model()
+        j = model.java
+        ctag = component or _first_component(j)
+        comp = j.modelNode(ctag)
+        action_lower = action.lower()
+
+        if action_lower == "list":
+            out = []
+            for mtag in _tags(comp.material()):
+                m = comp.material(mtag)
+                props = {}
+                for key in (
+                    "thermalconductivity",
+                    "density",
+                    "heatcapacity",
+                    "youngsmodulus",
+                    "poissonsratio",
+                    "electricconductivity",
+                    "relpermittivity",
+                    "dynamicviscosity",
+                ):
+                    value = _safe(
+                        lambda key=key, m=m: str(m.propertyGroup("def").get(key))
+                    )
+                    if value not in (None, "", "0.0"):
+                        props[key] = value
+                out.append({"tag": mtag, "label": _label(m), "properties": props})
+            return {
+                "component": ctag,
+                "materials": out,
+                "presets": sorted(MATERIAL_PRESETS),
+            }
+
+        if action_lower == "create":
+            values = dict(MATERIAL_PRESETS.get(preset.lower(), {}))
+            if preset and not values:
+                raise ValueError(f"未知预设 {preset}，可用：{sorted(MATERIAL_PRESETS)}")
+            values.update(properties or {})
+            if not values:
+                raise ValueError("create 需要 preset 或 properties。")
+            mtag = tag or f"mat{len(_tags(comp.material())) + 1}"
+            mat = comp.material().create(mtag, "Common")
+            changed = _set_props(mat.propertyGroup("def"), values)
+            return {
+                "material": mtag,
+                "preset": preset or None,
+                "properties_set": changed,
+            }
+
+        if action_lower == "update":
+            if not tag:
+                raise ValueError("update 需要 tag。")
+            mat = comp.material(tag)
+            changed = _set_props(mat.propertyGroup("def"), properties)
+            return {"material": tag, "properties_set": changed}
+
+        if action_lower in ("remove", "delete"):
+            if not tag:
+                raise ValueError("remove 需要 tag。")
+            comp.material().remove(tag)
+            return {"removed": tag}
+
+        raise ValueError(f"未知 action：{action}，可用：list/create/update/remove")
+
+    try:
+        return _json(WORKER.call(job, timeout=300))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+def _parameter_unit(j, name: str) -> str:
+    """从参数定义里取单位，例如 '373.15[K]' -> 'K'。"""
+    try:
+        value = str(j.param().get(name))
+    except Exception:
+        return ""
+    match = re.search(r"\[([^\]]+)\]", value)
+    return match.group(1) if match else ""
+
+
+@mcp.tool(
+    description=(
+        "参数扫描工具。action=list 查看现有研究及扫描配置；add 给研究加 Parametric "
+        "特征（parameters 是参数名列表，values 是每个参数的取值串，空格分隔，长度需与 "
+        "parameters 一致）；remove 删除扫描。加完后正常 comsol_solve 就会对所有组合求解。"
+    )
+)
+def comsol_sweep(
+    action: str = "list",
+    study: str = "",
+    parameters: list[str] | None = None,
+    values: list[str] | None = None,
+) -> str:
+    def job():
+        model = _need_model()
+        j = model.java
+        action_lower = action.lower()
+
+        if action_lower == "list":
+            out = []
+            for stag in _tags(j.study()):
+                s = j.study(stag)
+                feats = []
+                for ft in _tags(s.feature()):
+                    f = s.feature(ft)
+                    item: dict[str, Any] = {
+                        "tag": ft,
+                        "type": _safe(lambda f=f: str(f.getType())),
+                    }
+                    if item["type"] == "Parametric":
+                        item["parameters"] = [
+                            str(x) for x in _safe(lambda f=f: f.getStringArray("pname")) or []
+                        ]
+                        item["values"] = [
+                            str(x)
+                            for x in _safe(lambda f=f: f.getStringArray("plistarr")) or []
+                        ]
+                    feats.append(item)
+                out.append({"study": stag, "features": feats})
+            return {"studies": out}
+
+        studies = _tags(j.study())
+        study_tag = study or (studies[0] if studies else "")
+        if not study_tag:
+            raise RuntimeError("没有研究（study），先创建研究和求解特征。")
+        s = j.study(study_tag)
+
+        if action_lower == "add":
+            if not parameters or not values:
+                raise ValueError("add 需要 parameters 和 values。")
+            if len(parameters) != len(values):
+                raise ValueError("parameters 和 values 长度必须一致。")
+            if "param" in _tags(s.feature()):
+                p = s.feature("param")
+            else:
+                p = s.create("param", "Parametric")
+            p.set("pname", [str(x) for x in parameters])
+            p.set("plistarr", [str(x) for x in values])
+            p.set("punit", [_parameter_unit(j, str(x)) for x in parameters])
+            moved = False
+            try:
+                s.feature().move("param", 0)
+                moved = True
+            except Exception:
+                pass
+            return {
+                "study": study_tag,
+                "parameters": list(parameters),
+                "values": list(values),
+                "moved_first": moved,
+            }
+
+        if action_lower in ("remove", "delete"):
+            if "param" in _tags(s.feature()):
+                s.feature().remove("param")
+                return {"study": study_tag, "removed": "param"}
+            return {"study": study_tag, "removed": None}
+
+        raise ValueError(f"未知 action：{action}，可用：list/add/remove")
+
+    try:
+        return _json(WORKER.call(job, timeout=300))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool(
+    description=(
+        "模型管理。action=list 列出当前后端所有模型；remove 把模型从内存卸载（不删文件）；"
+        "rename 改模型显示名。切换当前模型用 comsol_use。"
+    )
+)
+def comsol_model(
+    action: str = "list",
+    name: str = "",
+    new_name: str = "",
+) -> str:
+    def job():
+        client = _need_client()
+        action_lower = action.lower()
+
+        if action_lower == "list":
+            return {
+                "models": [
+                    {
+                        "name": m.name(),
+                        "tag": str(m.java.tag()),
+                        "file": str(m.file()) if _has_file(m) else None,
+                    }
+                    for m in client.models()
+                ]
+            }
+
+        target = None
+        for m in client.models():
+            if name in (m.name(), str(m.java.tag())):
+                target = m
+                break
+        if target is None:
+            raise ValueError(f"找不到模型 {name}。")
+
+        if action_lower == "remove":
+            global MODEL
+            client.remove(target)
+            if MODEL is target:
+                MODEL = None
+            _refresh_state()
+            return {"removed": name, "current": None if MODEL is None else MODEL.name()}
+
+        if action_lower == "rename":
+            if not new_name:
+                raise ValueError("rename 需要 new_name。")
+            target.rename(new_name)
+            _refresh_state()
+            return {"renamed": new_name}
+
+        raise ValueError(f"未知 action：{action}，可用：list/remove/rename")
+
+    try:
+        return _json(WORKER.call(job, timeout=120))
+    except Exception as exc:
+        return _json({"error": str(exc)})
 
 
 # --------------------------------------------------------------------------
@@ -1188,7 +1564,7 @@ def comsol_params(values: dict[str, str] | None = None, evaluate: bool = False) 
 
     try:
         return _json(WORKER.call(job, timeout=120))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -1238,7 +1614,7 @@ def comsol_mesh(component: str = "", mesh: str = "", size: int = 0) -> str:
 
     try:
         return _json(WORKER.call(job, timeout=1800))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _set(last_error=str(exc))
         return _json({"error": str(exc)})
 
@@ -1285,7 +1661,7 @@ def comsol_solve(study: str = "", background: bool = False) -> str:
                         "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
                     },
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 _set(
                     busy=False,
                     job=None,
@@ -1303,7 +1679,7 @@ def comsol_solve(study: str = "", background: bool = False) -> str:
 
     try:
         return _json(WORKER.call(job, timeout=7200))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _set(last_error=str(exc))
         return _json({"error": str(exc)})
 
@@ -1322,6 +1698,8 @@ def comsol_solve(study: str = "", background: bool = False) -> str:
 def comsol_eval(expression: str, unit: str = "", dataset: str = "") -> str:
     def job():
         model = _need_model()
+        if not (_safe(model.solutions) or []):
+            raise RuntimeError("模型还没有求解结果，先运行 comsol_solve。")
         kwargs: dict[str, Any] = {}
         if unit:
             kwargs["unit"] = unit
@@ -1344,7 +1722,7 @@ def comsol_eval(expression: str, unit: str = "", dataset: str = "") -> str:
 
     try:
         return _json(WORKER.call(job, timeout=300))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         message = str(exc)
         if "dataset" in message.lower():
             message += "（模型可能还没有求解结果，先运行 comsol_solve）"
@@ -1406,7 +1784,7 @@ def comsol_plot(
 
     try:
         return _json(WORKER.call(job, timeout=600))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -1438,24 +1816,39 @@ def comsol_export(expression: str, file: str, unit: str = "") -> str:
             kwargs["unit"] = unit
         data = model.evaluate(expression, **kwargs)
         arr = np.asarray(data, dtype=float).ravel() if np is not None else [data]
+        coords: dict[str, Any] = {}
+        for axis in ("x", "y", "z"):
+            values_axis = _safe(lambda axis=axis: model.evaluate(axis))
+            if values_axis is not None and np is not None:
+                try:
+                    coords[axis] = np.asarray(values_axis, dtype=float).ravel()
+                except Exception:
+                    pass
         target = _resolve(file)
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["index", expression])
+            header = ["index"] + [axis for axis in ("x", "y", "z") if axis in coords] + [expression]
+            writer.writerow(header)
             for i, value in enumerate(arr):
-                writer.writerow([i, float(value)])
+                row = [i] + [
+                    float(coords[axis][i])
+                    for axis in ("x", "y", "z")
+                    if axis in coords and i < len(coords[axis])
+                ]
+                writer.writerow(row + [float(value)])
         return {
             "expression": expression,
             "unit": unit or None,
-            "rows": int(len(arr)),
+            "rows": len(arr),
+            "columns": header,
             "file": str(target),
             "size_bytes": target.stat().st_size,
         }
 
     try:
         return _json(WORKER.call(job, timeout=600))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -1491,13 +1884,15 @@ def comsol_python(code: str) -> str:
             last = ast.Expression(tree.body.pop().value)
         exec(compile(tree, "<comsol_python>", "exec"), env)  # noqa: S102
         if last is not None:
-            value = eval(compile(last, "<comsol_python>", "eval"), env)  # noqa: S307
+            value = eval(compile(last, "<comsol_python>", "eval"), env)
             return {"result": _serialize(value)}
         return {"result": None}
 
     try:
-        return _json(WORKER.call(job, timeout=3600))
-    except Exception as exc:  # noqa: BLE001
+        result = WORKER.call(job, timeout=3600)
+        WORKER.call(_refresh_state, timeout=60)
+        return _json(result)
+    except Exception as exc:
         _set(last_error=str(exc))
         return _json({"error": str(exc), "traceback": traceback.format_exc()})
 
@@ -1562,7 +1957,7 @@ def comsol_desktop(open_file: str = "") -> str:
                 "hint": "在弹窗里点 Connect；之后 Desktop 与 MCP 共享同一个模型。",
             }
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
 
 
@@ -1576,7 +1971,7 @@ def comsol_screenshot(file: str = "") -> str:
     try:
         import win32gui
         from PIL import ImageGrab
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": f"缺少截图依赖：{exc}"})
 
     handles: list[tuple[int, str]] = []
@@ -1599,7 +1994,7 @@ def comsol_screenshot(file: str = "") -> str:
         minimized = 1 if win32gui.IsIconic(hwnd) else 0
         return (minimized, 0 if ".mph" in title else 1, -int(hwnd))
 
-    hwnd, title = sorted(handles, key=score)[0]
+    hwnd, title = min(handles, key=score)
     restored = False
     try:
         if win32gui.IsIconic(hwnd):
@@ -1625,7 +2020,7 @@ def comsol_screenshot(file: str = "") -> str:
                 "was_minimized": restored,
             }
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return _json({"error": str(exc)})
     finally:
         if restored:

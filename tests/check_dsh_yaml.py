@@ -17,7 +17,7 @@ JsLoader.add_multi_constructor(
 
 path = sys.argv[1]
 with open(path, encoding="utf-8") as fh:
-    data = yaml.load(fh, Loader=JsLoader)  # noqa: S506
+    data = yaml.load(fh, Loader=JsLoader)
 
 insert = data[0]["insert"]
 print(f"entries: {len(insert)}")
