@@ -660,6 +660,497 @@ def comsol_inspect() -> str:
 
 
 # --------------------------------------------------------------------------
+# 通用建模：几何 / 物理场 / 选择
+# --------------------------------------------------------------------------
+
+
+def _set_props(node, properties: dict | None) -> list[str]:
+    """把 Python 字典写进 COMSOL 节点，返回成功设置的键。"""
+    keys = []
+    for key, value in (properties or {}).items():
+        if isinstance(value, bool):
+            node.set(key, _jboolean(value))
+        elif isinstance(value, int):
+            node.set(key, _jint(value))
+        elif isinstance(value, float):
+            node.set(key, float(value))
+        elif isinstance(value, (list, tuple)):
+            node.set(key, [str(x) for x in value])
+        else:
+            node.set(key, str(value))
+        keys.append(key)
+    return keys
+
+
+def _jint(value: int):
+    import jpype
+
+    return jpype.JInt(int(value))
+
+
+def _jboolean(value: bool):
+    import jpype
+
+    return jpype.JBoolean(bool(value))
+
+
+def _first_component(j) -> str:
+    tags = _tags(j.modelNode())
+    if not tags:
+        raise RuntimeError("模型里没有组件，先创建组件（comsol_geometry 会自动建）。")
+    return tags[0]
+
+
+def _ensure_component(j, component: str = "", dimension: int = 3) -> str:
+    tags = _tags(j.modelNode())
+    if component and component in tags:
+        return component
+    if tags:
+        return tags[0]
+    j.modelNode().create("comp1")
+    j.modelNode("comp1").geom().create("geom1", int(dimension or 3))
+    return "comp1"
+
+
+def _ensure_geometry(j, component: str, geometry: str = "", dimension: int = 3) -> str:
+    comp = j.modelNode(component)
+    tags = _tags(comp.geom())
+    if geometry and geometry in tags:
+        return geometry
+    if tags:
+        return tags[0]
+    comp.geom().create("geom1", int(dimension or 3))
+    return "geom1"
+
+
+def _geometry_dim(j, component: str, geometry: str) -> int:
+    try:
+        return int(j.modelNode(component).geom(geometry).getSDim())
+    except Exception:
+        return 3
+
+
+@mcp.tool(
+    description=(
+        "通用几何工具。action=list 列出现有几何和特征；create 新建特征"
+        "（feature_type 如 Block/Cylinder/Sphere/Rectangle/Circle/Import/Union/Difference）；"
+        "update 改属性；delete 删除特征；run 重建几何。"
+        "properties 是属性字典，如 {\"size\": [\"0.1\",\"0.1\",\"0.1\"], \"pos\": [\"0\",\"0\",\"0\"]}。"
+        "模型没有组件/几何时会自动创建（dimension 指定 2 或 3）。"
+    )
+)
+def comsol_geometry(
+    action: str = "list",
+    component: str = "",
+    geometry: str = "",
+    tag: str = "",
+    feature_type: str = "",
+    properties: dict | None = None,
+    dimension: int = 0,
+) -> str:
+    def job():
+        model = _need_model()
+        j = model.java
+        action_lower = action.lower()
+
+        if action_lower == "list":
+            out = []
+            for ctag in _tags(j.modelNode()):
+                comp = j.modelNode(ctag)
+                for gtag in _tags(comp.geom()):
+                    g = comp.geom(gtag)
+                    out.append(
+                        {
+                            "component": ctag,
+                            "geometry": gtag,
+                            "dim": _safe(g.getSDim),
+                            "domains": _safe(g.getNDomains),
+                            "boundaries": _safe(g.getNBoundaries),
+                            "features": [
+                                {
+                                    "tag": t,
+                                    "type": _safe(lambda t=t: str(g.feature(t).getType())),
+                                }
+                                for t in _tags(g.feature())
+                            ],
+                        }
+                    )
+            return {"geometries": out}
+
+        ctag = _ensure_component(j, component, dimension or 3)
+        gtag = _ensure_geometry(j, ctag, geometry, dimension or 3)
+        g = j.modelNode(ctag).geom(gtag)
+
+        if action_lower in ("create", "add"):
+            if not feature_type:
+                raise ValueError("create 需要 feature_type，例如 Block。")
+            feature_tag = tag or f"{feature_type.lower()}_{len(_tags(g.feature())) + 1}"
+            feat = g.create(feature_tag, feature_type)
+            changed = _set_props(feat, properties)
+            return {
+                "created": feature_tag,
+                "feature_type": feature_type,
+                "component": ctag,
+                "geometry": gtag,
+                "properties_set": changed,
+            }
+
+        if action_lower in ("update", "set"):
+            if not tag:
+                raise ValueError("update 需要 tag。")
+            feat = g.feature(tag)
+            changed = _set_props(feat, properties)
+            return {"updated": tag, "properties_set": changed}
+
+        if action_lower in ("delete", "remove"):
+            if not tag:
+                raise ValueError("delete 需要 tag。")
+            g.feature().remove(tag)
+            return {"removed": tag}
+
+        if action_lower == "run":
+            t0 = time.time()
+            g.run()
+            return {
+                "geometry": gtag,
+                "domains": _safe(g.getNDomains),
+                "boundaries": _safe(g.getNBoundaries),
+                "elapsed_s": round(time.time() - t0, 2),
+            }
+
+        raise ValueError(f"未知 action：{action}")
+
+    try:
+        return _json(WORKER.call(job, timeout=600))
+    except Exception as exc:  # noqa: BLE001
+        return _json({"error": str(exc)})
+
+
+@mcp.tool(
+    description=(
+        "通用物理场工具。action=list 列出接口和特征；add_interface 新建接口"
+        "（physics_type 如 HeatTransfer/SolidMechanics/LaminarFlow/Electrostatics）；"
+        "add_feature 给接口加特征（feature_type 如 TemperatureBoundary/HeatFluxBoundary/InletBoundary）；"
+        "update_feature 设置选择或属性；remove_feature/remove_interface 删除。"
+        "selection 传实体编号列表，或 named_selection 传命名选择的 tag。"
+        "dimension 为特征维度，0 表示按几何自动推断（3D 边界=2，2D 边界=1）。"
+    )
+)
+def comsol_physics(
+    action: str = "list",
+    component: str = "",
+    physics: str = "",
+    physics_type: str = "",
+    tag: str = "",
+    feature_type: str = "",
+    selection: list[int] | None = None,
+    named_selection: str = "",
+    properties: dict | None = None,
+    dimension: int = 0,
+) -> str:
+    def job():
+        model = _need_model()
+        j = model.java
+        action_lower = action.lower()
+        ctag = component or _first_component(j)
+
+        if action_lower == "list":
+            out = []
+            for ptag in _tags(j.modelNode(ctag).physics()):
+                p = j.modelNode(ctag).physics(ptag)
+                out.append(
+                    {
+                        "tag": ptag,
+                        "type": _safe(lambda p=p: str(p.getType())),
+                        "label": _label(p),
+                        "features": [
+                            {
+                                "tag": ft,
+                                "type": _safe(lambda ft=ft: str(p.feature(ft).getType())),
+                                "selection": _safe(
+                                    lambda ft=ft: [
+                                        int(x) for x in p.feature(ft).selection().entities()
+                                    ]
+                                ),
+                            }
+                            for ft in _tags(p.feature())
+                        ],
+                    }
+                )
+            return {"component": ctag, "physics": out}
+
+        if action_lower == "add_interface":
+            if not physics_type:
+                raise ValueError("add_interface 需要 physics_type。")
+            gtag = _ensure_geometry(j, ctag, "", 3)
+            ptag = tag or physics_type.lower()[:8]
+            p = j.modelNode(ctag).physics().create(ptag, physics_type, gtag)
+            return {
+                "interface": ptag,
+                "type": physics_type,
+                "geometry": gtag,
+            }
+
+        if action_lower == "remove_interface":
+            if not physics:
+                raise ValueError("remove_interface 需要 physics。")
+            j.modelNode(ctag).physics().remove(physics)
+            return {"removed": physics}
+
+        if not physics:
+            raise ValueError("该操作需要 physics（接口 tag）。")
+        p = j.modelNode(ctag).physics(physics)
+
+        if action_lower == "add_feature":
+            if not feature_type:
+                raise ValueError("add_feature 需要 feature_type。")
+            dim = dimension or max(1, _geometry_dim(j, ctag, _tags(j.modelNode(ctag).geom())[0]) - 1)
+            ftag = tag or f"{feature_type.lower()[:8]}_{len(_tags(p.feature())) + 1}"
+            feat = p.create(ftag, feature_type, int(dim))
+            if named_selection:
+                feat.selection().named(named_selection)
+            elif selection:
+                feat.selection().set([int(x) for x in selection])
+            changed = _set_props(feat, properties)
+            return {
+                "feature": ftag,
+                "type": feature_type,
+                "dimension": int(dim),
+                "selection": _safe(lambda: [int(x) for x in feat.selection().entities()]),
+                "properties_set": changed,
+            }
+
+        if action_lower in ("update_feature", "set_feature"):
+            if not tag:
+                raise ValueError("update_feature 需要 tag。")
+            feat = p.feature(tag)
+            if named_selection:
+                feat.selection().named(named_selection)
+            elif selection is not None:
+                feat.selection().set([int(x) for x in selection])
+            changed = _set_props(feat, properties)
+            return {
+                "feature": tag,
+                "selection": _safe(lambda: [int(x) for x in feat.selection().entities()]),
+                "properties_set": changed,
+            }
+
+        if action_lower == "remove_feature":
+            if not tag:
+                raise ValueError("remove_feature 需要 tag。")
+            p.feature().remove(tag)
+            return {"removed": tag}
+
+        raise ValueError(f"未知 action：{action}")
+
+    try:
+        return _json(WORKER.call(job, timeout=600))
+    except Exception as exc:  # noqa: BLE001
+        return _json({"error": str(exc)})
+
+
+@mcp.tool(
+    description=(
+        "命名选择工具（对应 COMSOL 的 Box/Ball/Explicit Selection）。"
+        "action=list 列出选择及其实体；create 创建选择；remove 删除。"
+        "selection_type=Box 时用 box=[xmin,xmax,ymin,ymax,zmin,zmax]（2D 可只给 4 个数）；"
+        "Ball 时用 center=[x,y,z] + radius；Explicit 时用 entities=[...]。"
+        "entity_dim 为选择的实体维度：3=域、2=面（3D 边界）、1=边、0=自动取几何维度。"
+        "创建后可在 comsol_physics 里用 named_selection 把选择绑到边界条件上。"
+    )
+)
+def comsol_selection(
+    action: str = "list",
+    component: str = "",
+    tag: str = "",
+    selection_type: str = "Box",
+    entity_dim: int = 0,
+    box: list[float] | None = None,
+    center: list[float] | None = None,
+    radius: float = 0.0,
+    entities: list[int] | None = None,
+    condition: str = "inside",
+) -> str:
+    def job():
+        model = _need_model()
+        j = model.java
+        ctag = component or _first_component(j)
+        comp = j.modelNode(ctag)
+        action_lower = action.lower()
+
+        if action_lower == "list":
+            out = []
+            for stag in _tags(comp.selection()):
+                sel = comp.selection(stag)
+                out.append(
+                    {
+                        "tag": stag,
+                        "type": _safe(lambda sel=sel: str(sel.getType())),
+                        "entities": _safe(lambda sel=sel: [int(x) for x in sel.entities()]),
+                    }
+                )
+            return {"component": ctag, "selections": out}
+
+        if action_lower == "remove":
+            if not tag:
+                raise ValueError("remove 需要 tag。")
+            comp.selection().remove(tag)
+            return {"removed": tag}
+
+        if action_lower != "create":
+            raise ValueError(f"未知 action：{action}")
+
+        sel_tag = tag or f"sel_{len(_tags(comp.selection())) + 1}"
+
+        geom_tag = _tags(comp.geom())[0] if _tags(comp.geom()) else ""
+        gdim = _geometry_dim(j, ctag, geom_tag) if geom_tag else 3
+        dim = int(entity_dim) if entity_dim else gdim
+
+        sel = comp.selection().create(sel_tag, selection_type)
+        try:
+            sel.set("entitydim", _jint(dim))
+        except Exception:
+            pass
+
+        if selection_type == "Box":
+            if not box:
+                raise ValueError("Box 选择需要 box 坐标。")
+            coords = list(box)
+            if len(coords) == 4:
+                coords = coords + [-0.01, 0.01]
+            names = ["xmin", "xmax", "ymin", "ymax", "zmin", "zmax"]
+            for name, value in zip(names, coords):
+                sel.set(name, float(value))
+            sel.set("condition", condition)
+        elif selection_type == "Ball":
+            if not center or len(center) < 2:
+                raise ValueError("Ball 选择需要 center。")
+            sel.set("pos", [str(x) for x in center])
+            sel.set("r", float(radius or 0.01))
+            sel.set("condition", condition)
+        elif selection_type == "Explicit":
+            if not entities:
+                raise ValueError("Explicit 选择需要 entities。")
+            sel.selection().set([int(x) for x in entities])
+        else:
+            raise ValueError(f"不支持的 selection_type：{selection_type}")
+
+        return {
+            "selection": sel_tag,
+            "type": selection_type,
+            "entity_dim": dim,
+            "entities": _safe(lambda: [int(x) for x in sel.entities()]),
+        }
+
+    try:
+        return _json(WORKER.call(job, timeout=120))
+    except Exception as exc:  # noqa: BLE001
+        return _json({"error": str(exc)})
+
+
+@mcp.tool(
+    description=(
+        "模型体检：列出 COMSOL 报告的问题（未定义变量、空选择、几何/网格问题），"
+        "并检查是否缺几何、物理场、材料、网格、研究或解。求解失败后先跑这个。"
+    )
+)
+def comsol_diagnose() -> str:
+    def job():
+        model = _need_model()
+        j = model.java
+        report: dict[str, Any] = {
+            "model": model.name(),
+            "problems": _safe(model.problems) or [],
+            "checks": [],
+            "warnings": [],
+        }
+        comps = _tags(j.modelNode())
+        report["components"] = comps
+        if not comps:
+            report["checks"].append("模型没有组件")
+        for ctag in comps:
+            comp = j.modelNode(ctag)
+            geoms = _tags(comp.geom())
+            if not geoms:
+                report["checks"].append(f"{ctag}: 没有几何")
+            else:
+                g = comp.geom(geoms[0])
+                nd = _safe(g.getNDomains) or 0
+                if nd == 0:
+                    report["checks"].append(f"{ctag}: 几何没有任何域，是否忘了 run？")
+            if not _tags(comp.physics()):
+                report["checks"].append(f"{ctag}: 没有物理场")
+            if not _tags(comp.material()):
+                report["checks"].append(f"{ctag}: 没有材料")
+            if not _tags(comp.mesh()):
+                report["checks"].append(f"{ctag}: 没有网格")
+        studies = _tags(j.study())
+        if not studies:
+            report["checks"].append("没有研究（study）")
+        report["solutions"] = _safe(model.solutions) or []
+        if not report["solutions"]:
+            report["warnings"].append("还没有求解结果")
+        report["ok"] = not report["problems"] and not report["checks"]
+        return report
+
+    try:
+        return _json(WORKER.call(job, timeout=120))
+    except Exception as exc:  # noqa: BLE001
+        return _json({"error": str(exc)})
+
+
+HELP_TOPICS: dict[str, str] = {
+    "geometry": (
+        "3D: Block(size=[x,y,z], pos=[x,y,z]) / Cylinder(r, h, pos, axis) / "
+        "Sphere(r, pos) / Import(filename). 2D: Rectangle(size=[w,h], pos) / "
+        "Circle(r, pos). 布尔: Union/Difference/Intersection，用 input=[tag1,tag2]。"
+        "创建后调用 action=run 才会生效。"
+    ),
+    "heat": (
+        "接口 HeatTransfer。边界特征：TemperatureBoundary(T0，如 '373.15[K]')、"
+        "HeatFluxBoundary(q0，如 '1e4[W/m^2]')、ConvectiveHeatFlux(h, Text)、"
+        "ThermalInsulation(无属性)。域特征：HeatSource(Q0)。"
+        "材料属性组 def：thermalconductivity、density、heatcapacity。"
+    ),
+    "solid": (
+        "接口 SolidMechanics。边界：Fixed(无属性)、BoundaryLoad(Fx/Fy/Fz 或 perarea)、"
+        "Roller。域：LinearElasticMaterial(E, nu, rho)。"
+        "材料 def：youngsmodulus、poissonsratio、density。"
+    ),
+    "flow": (
+        "接口 LaminarFlow。边界：InletBoundary(U0 或 Uavf)、OutletBoundary(p0)、Wall。"
+        "材料 def：density、dynamicviscosity。"
+    ),
+    "electrostatics": (
+        "接口 Electrostatics。边界：Ground(无属性)、Terminal(V0 或 Q0)。"
+        "材料 def：relpermittivity、electricconductivity。"
+    ),
+    "selection": (
+        "Box: box=[xmin,xmax,ymin,ymax,zmin,zmax], entity_dim 3=域/2=面/1=边。"
+        "Ball: center=[x,y,z], radius。Explicit: entities=[编号]。"
+        "绑定到物理场：comsol_physics 的 named_selection 参数。"
+    ),
+    "mesh": (
+        "comsol_mesh 的 size 1-9（5 左右日常够用）。局部细化可在 "
+        "comsol_python 里用 mesh.create('ftr1','Size') + selection。"
+    ),
+}
+
+
+@mcp.tool(
+    description=(
+        "COMSOL 建模速查，不访问 COMSOL。topic 可选 geometry/heat/solid/flow/"
+        "electrostatics/selection/mesh。写模型前先查，能少踩属性名和单位的坑。"
+    )
+)
+def comsol_help(topic: str = "geometry") -> str:
+    key = topic.lower().strip()
+    if key in HELP_TOPICS:
+        return _json({"topic": key, "cheatsheet": HELP_TOPICS[key]})
+    return _json({"topics": list(HELP_TOPICS)})
+
+
+# --------------------------------------------------------------------------
 # 参数
 # --------------------------------------------------------------------------
 

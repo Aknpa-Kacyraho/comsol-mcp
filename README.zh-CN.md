@@ -102,6 +102,11 @@ python tests\smoke_test.py
 | `comsol_use` | 多模型时切换当前操作对象 |
 | `comsol_save` | 保存/另存，自动备份 |
 | `comsol_inspect` | 模型结构树：参数、几何、物理场、选择、材料、网格、研究、结果 |
+| `comsol_geometry` | 通用几何：Block/Cylinder/Sphere/Rectangle/Circle/Import/布尔运算的增删改与构建 |
+| `comsol_physics` | 通用物理场：建接口、加特征、绑选择、设属性 |
+| `comsol_selection` | 命名选择（Box/Ball/Explicit），供边界条件复用 |
+| `comsol_diagnose` | 模型体检：COMSOL 报告的问题 + 缺失的几何/物理场/材料/网格/研究 |
+| `comsol_help` | 离线速查：几何、传热、结构、流动、静电、选择、网格的属性名 |
 | `comsol_params` | 读写全局参数（支持 `200[A]`、`1.5[mm]`） |
 | `comsol_mesh` | 生成网格，可选密度 1–9 |
 | `comsol_solve` | 运行研究，支持后台模式 |
@@ -134,7 +139,7 @@ COMSOL 支持 client–server 模式：server 持有模型，Desktop 只是客�
 
 ## 逃生舱示例
 
-16 个工具覆盖不到的操作，都可以用 `comsol_python` 完成（可用 `model`、`java`、`client`、`mph`、`np`）：
+21 个工具覆盖不到的操作，都可以用 `comsol_python` 完成（可用 `model`、`java`、`client`、`mph`、`np`）：
 
 ```python
 ht = java.modelNode('comp1').physics('ht')
@@ -167,6 +172,12 @@ flux.set('q0', '1e4[W/m^2]')
 - 求解进度只有"运行中/已完成"，没有百分比。
 - `comsol_screenshot` 会先把 COMSOL 窗口置前再截图，会短暂抢焦点。
 - 截图、启动 Desktop 仅 Windows。
+
+## 致谢
+
+- [MPh](https://github.com/MPh-py/MPh) — Python 调用 COMSOL Java API 的桥梁。
+- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — server 框架。
+- 设计参考：[wjc9011/COMSOL_Multiphysics_MCP](https://github.com/wjc9011/COMSOL_Multiphysics_MCP) 和 [Ching-Chiang/comsol-mcp](https://github.com/Ching-Chiang/comsol-mcp)。`comsol_geometry` / `comsol_physics` 的「feature type + properties」通用模式来自这两个项目。
 
 ## 免责声明
 

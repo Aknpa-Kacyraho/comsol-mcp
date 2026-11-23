@@ -107,6 +107,11 @@ The smoke test starts its own COMSOL server on a random port and cleans up after
 | `comsol_use` | Switch the active model when several are loaded |
 | `comsol_save` | Save or save-as, with automatic backups |
 | `comsol_inspect` | Structured model tree: parameters, geometry, physics, selections, materials, mesh, studies, results |
+| `comsol_geometry` | Create/update/delete/build geometry features: Block, Cylinder, Sphere, Rectangle, Circle, Import, booleans |
+| `comsol_physics` | Create physics interfaces and features, bind selections, set properties |
+| `comsol_selection` | Named Box / Ball / Explicit selections, then reuse them in boundary conditions |
+| `comsol_diagnose` | Model health check: COMSOL-reported problems plus missing geometry/physics/material/mesh/study |
+| `comsol_help` | Offline cheat sheets for geometry, heat, solid, flow, electrostatics, selection, mesh |
 | `comsol_params` | Read or set global parameters (`200[A]`, `1.5[mm]`, ...) |
 | `comsol_mesh` | Build the mesh, optional density level 1–9 |
 | `comsol_solve` | Run a study, foreground or background |
@@ -147,7 +152,7 @@ python examples\heat_transfer_2d.py
 
 ## Escape hatch
 
-Anything the 16 tools do not cover can be done through `comsol_python`, which exposes `model`, `java`, `client`, `mph`, `np`:
+Anything the 21 tools do not cover can be done through `comsol_python`, which exposes `model`, `java`, `client`, `mph`, `np`:
 
 ```python
 ht = java.modelNode('comp1').physics('ht')
@@ -180,6 +185,12 @@ Useful Java API entry points:
 - Progress reporting during solve is coarse — the job is either running or finished, no percentage.
 - `comsol_screenshot` brings the COMSOL window to the foreground before capturing; it will briefly steal focus.
 - Windows-specific helpers: screenshot, and launching Desktop. Everything else works wherever MPh works.
+
+## Acknowledgements
+
+- [MPh](https://github.com/MPh-py/MPh) — the Python bridge to the COMSOL Java API that makes all of this possible.
+- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — server framework.
+- Prior art that informed the tool design: [wjc9011/COMSOL_Multiphysics_MCP](https://github.com/wjc9011/COMSOL_Multiphysics_MCP) and [Ching-Chiang/comsol-mcp](https://github.com/Ching-Chiang/comsol-mcp). Their generic "feature type + properties" pattern is what our `comsol_geometry` / `comsol_physics` tools follow.
 
 ## Disclaimer
 

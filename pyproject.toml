@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "comsol-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that drives COMSOL Multiphysics through its Java API (via MPh), with a live COMSOL Desktop sharing the same session."
 readme = "README.md"
 requires-python = ">=3.11"
