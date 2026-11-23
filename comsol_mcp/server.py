@@ -1505,10 +1505,23 @@ def comsol_model(
 
         if action_lower == "remove":
             global MODEL
+            target_tag = str(target.java.tag())
+            current_tag = None
+            if MODEL is not None:
+                try:
+                    current_tag = str(MODEL.java.tag())
+                except Exception:  # noqa: BLE001
+                    current_tag = None
+            was_current = current_tag == target_tag
             client.remove(target)
-            if MODEL is target:
+            if was_current:
                 MODEL = None
             _refresh_state()
+            if was_current:
+                remaining = client.models()
+                if remaining:
+                    MODEL = remaining[0]
+                    _refresh_state()
             return {"removed": name, "current": None if MODEL is None else MODEL.name()}
 
         if action_lower == "rename":

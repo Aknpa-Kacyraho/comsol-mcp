@@ -50,6 +50,7 @@ python -c "import comsol_mcp; print(comsol_mcp.__version__)"
 python tests\smoke_test.py
 python tests\modeling_test.py
 python tests\full_test.py
+python tests\edge_test.py
 ```
 
 Each test starts its own COMSOL server on a random port and cleans up after itself.

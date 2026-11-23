@@ -43,15 +43,17 @@
 | 端口复用 | `comsol_start` 对 `port=0` 返回 0 而不是真实端口 | 读取 `Client.port` |
 | 异常兜底 | COMSOL 会抛各种 `FlException` | 统一在工具边界捕获并转 JSON；ruff 配置里说明这是有意为之 |
 | 进程泄漏 | 客户端重连会留下未退出的实例 | 空闲 30 分钟自动退出；求解中不退出 |
+| 删除当前模型 | `MODEL is target` 用对象身份比较不可靠，删完仍指向死对象，后续调用全崩 | 改为比较 tag；删除后自动切到剩余模型 |
 | 日志 | 写 `logs/comsol-mcp.log`，stdout 只留给协议 | 保持 |
 | 依赖 | mph / mcp / pillow / numpy / pywin32 | pyproject 声明，Windows 条件依赖 |
 
 ## 回归结果
 
 ```
-smoke_test.py      all checks passed   38.7s
-modeling_test.py   all checks passed   38.2s
-full_test.py       all checks passed   41.1s
+smoke_test.py      all checks passed   39.8s
+modeling_test.py   all checks passed   39.6s
+full_test.py       all checks passed   42.4s
+edge_test.py       all checks passed   28.6s
 ruff check         All checks passed!
 ```
 

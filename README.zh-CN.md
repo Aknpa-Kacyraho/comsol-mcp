@@ -50,6 +50,7 @@ python -c "import comsol_mcp; print(comsol_mcp.__version__)"
 python tests\smoke_test.py
 python tests\modeling_test.py
 python tests\full_test.py
+python tests\edge_test.py
 ```
 
 每个测试都会在随机端口起独立 server，跑完自动清理，不影响正在使用的 COMSOL。
