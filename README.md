@@ -172,6 +172,7 @@ Useful Java API entry points:
 | `COMSOL_ROOT` | auto-detected | COMSOL installation root |
 | `COMSOL_PORT` | `2036` | Default server port |
 | `COMSOL_MCP_HOME` | current directory | Where `logs/` and `out/` are written |
+| `COMSOL_MCP_IDLE_TIMEOUT` | `1800` | Exit after this many idle seconds; `0` disables. Prevents stale processes piling up when a client disconnects. |
 
 ## Limitations
 

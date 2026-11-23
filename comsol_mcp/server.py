@@ -60,6 +60,8 @@ def _comsol_root() -> Path | None:
 
 COMSOL_ROOT = _comsol_root()
 DEFAULT_PORT = int(os.environ.get("COMSOL_PORT", "2036"))
+# 空闲多久后自动退出（秒）。0 表示禁用。避免客户端遗弃后进程堆积。
+IDLE_TIMEOUT = int(os.environ.get("COMSOL_MCP_IDLE_TIMEOUT", "1800"))
 
 
 def _comsol_exe(name: str = "comsol.exe") -> Path:
@@ -145,6 +147,7 @@ class Worker:
                 done.set()
 
     def call(self, fn, timeout: float | None = None):
+        _touch()
         if threading.current_thread() is self._thread:
             return fn()
         box: dict[str, Any] = {}
@@ -166,6 +169,27 @@ class Worker:
 
 
 WORKER = Worker()
+
+# 最后一次工具调用时间：用于空闲退出，防止客户端断开后进程堆积
+LAST_ACTIVITY = [time.time()]
+
+
+def _touch() -> None:
+    LAST_ACTIVITY[0] = time.time()
+
+
+def _idle_watchdog() -> None:
+    interval = 30 if IDLE_TIMEOUT <= 0 else max(1, min(30, IDLE_TIMEOUT))
+    while True:
+        time.sleep(interval)
+        if IDLE_TIMEOUT <= 0:
+            continue
+        if time.time() - LAST_ACTIVITY[0] > IDLE_TIMEOUT:
+            log.info("Idle for %ss, exiting to avoid a stale process.", IDLE_TIMEOUT)
+            os._exit(0)
+
+
+threading.Thread(target=_idle_watchdog, name="idle-watchdog", daemon=True).start()
 
 # worker 线程里持有的真实对象
 CLIENT = None

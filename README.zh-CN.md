@@ -159,6 +159,7 @@ flux.set('q0', '1e4[W/m^2]')
 | `COMSOL_ROOT` | 自动发现 | COMSOL 安装根目录 |
 | `COMSOL_PORT` | `2036` | 默认 server 端口 |
 | `COMSOL_MCP_HOME` | 当前目录 | `logs/`、`out/` 的存放位置 |
+| `COMSOL_MCP_IDLE_TIMEOUT` | `1800` | 空闲多少秒后自动退出；`0` 表示禁用。防止客户端断开后进程堆积。 |
 
 ## 已知限制
 
