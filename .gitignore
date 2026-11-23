@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# COMSOL MCP runtime
+logs/
+out/
+comsol-out/
+comsol-logs/
+*.log
+
+# Local models / generated results
+*.mph
+*.mph.bak-*
+bak-*
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
+
+# Local test artifacts
+vendor/
+check_jsonc.py
+mcp_smoke.py
+probe_solve.py
+test_tools.py
